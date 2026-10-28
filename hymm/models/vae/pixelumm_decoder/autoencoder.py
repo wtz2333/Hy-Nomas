@@ -330,12 +330,12 @@ class PixelUMMDCAELatentDecoder(nn.Module):
             )
         return torch.cat(frames, dim=2)
 
-    def _noise_tile(self, latent: torch.Tensor) -> XtSource:
+    def _noise_tile(self, latent: torch.Tensor, *, frame_offset: int = 0) -> XtSource:
         def source(t0: int, t1: int, y: int, x: int, th: int, tw: int) -> torch.Tensor:
-            key = (latent.data_ptr(), tuple(latent.shape), t0, t1)
+            key = (latent.data_ptr(), tuple(latent.shape), t0, t1, frame_offset)
             if self._noise_cache is None or self._noise_cache[0] != key:
                 self._noise_cache = None
-                self._noise_cache = (key, self._make_noise(latent, t0, t1))
+                self._noise_cache = (key, self._make_noise(latent, t0 + frame_offset, t1 + frame_offset))
             return self._noise_cache[1][..., y * 32 : (y + th) * 32, x * 32 : (x + tw) * 32]
 
         return source
@@ -509,7 +509,7 @@ class PixelUMMDCAELatentDecoder(nn.Module):
             raise ValueError("PixelUMM distributed decode requires identical latent values")
 
     def create_streaming_decode_session(
-        self, *, to_cpu: bool = True, retain_history: bool = True
+        self, *, to_cpu: bool = True, retain_history: bool = True, rolling: bool = False
     ) -> "PixelUMMStreamingDecodeSession":
         """Open-ended global-window decode timeline (the PixelUMM stable-prefix streaming protocol)."""
         if self.num_steps != 1:
@@ -519,7 +519,7 @@ class PixelUMMDCAELatentDecoder(nn.Module):
             raise ValueError(
                 f"PixelUMM streaming decode requires num_steps=1, got {self.num_steps}"
             )
-        return PixelUMMStreamingDecodeSession(self, to_cpu=to_cpu, retain_history=retain_history)
+        return PixelUMMStreamingDecodeSession(self, to_cpu=to_cpu, retain_history=retain_history, rolling=rolling)
 
     @torch.no_grad()
     @cpu_offloaded
@@ -610,9 +610,9 @@ class PixelUMMStreamingDecodeSession(WindowStreamingDecodeSession):
         try:
             video = model._predict_x0(
                 self.buffer,
-                model._noise_tile(self.buffer),
+                model._noise_tile(self.buffer, frame_offset=self.buffer_latent_start),
                 all_ranks=False,
-                t_starts=starts,
+                t_starts=[start - self.buffer_latent_start for start in starts],
                 pad_short=self._tail_fix(),
             )
         finally:

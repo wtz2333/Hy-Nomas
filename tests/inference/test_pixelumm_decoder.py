@@ -446,6 +446,52 @@ def test_streaming_rollback_replaces_last_push_without_changing_prefix():
     torch.testing.assert_close(assembled, expected, rtol=0, atol=1e-6)
 
 
+@pytest.mark.parametrize("lengths", [[1] * 81, [3, 1, 7, 2, 16, 5, 1], [2], [4], [5], [8, 1]])
+@pytest.mark.parametrize("tail_hold", [0, 1])
+def test_rolling_stable_prefix_and_flush_equal_legacy(lengths, tail_hold):
+    wrapper = _streaming_wrapper(tail_hold_latents=tail_hold)
+    legacy = wrapper.create_streaming_decode_session(to_cpu=True, retain_history=False)
+    rolling = wrapper.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True)
+    generator = torch.Generator().manual_seed(301)
+    for index, length in enumerate(lengths):
+        latent = torch.randn((1, 32, length, 1, 1), generator=generator)
+        pixels = length * 4 - index % 4
+        legacy.final_segment = rolling.final_segment = index + 1 == len(lengths)
+        expected = legacy.push(latent, pixel_frames=pixels)
+        actual = rolling.push(latent, pixel_frames=pixels)
+        assert torch.equal(actual, expected)
+        assert rolling.available_latent_frames == legacy.available_latent_frames
+        assert rolling.stable_pixel_frames == legacy.stable_pixel_frames
+        assert rolling.withheld_pixel_frames == legacy.withheld_pixel_frames
+        assert rolling.buffer.shape[2] <= 2 * rolling.window + rolling.stride
+        assert len(rolling.push_latent_frames) <= 2 * rolling.window
+        assert not rolling.committed
+    assert torch.equal(rolling.finish(), legacy.finish())
+    assert rolling.stable_pixel_frames == sum(length * 4 - index % 4 for index, length in enumerate(lengths))
+    assert rolling.buffer.numel() == 0 and rolling.pending is None
+    assert not rolling.push_latent_frames
+
+
+def test_rolling_rejects_unavailable_history_before_mutation():
+    wrapper = _streaming_wrapper()
+    with pytest.raises(ValueError, match="retain_history=False"):
+        wrapper.create_streaming_decode_session(rolling=True)
+    session = wrapper.create_streaming_decode_session(retain_history=False, rolling=True)
+    with pytest.raises(ValueError, match="previews"):
+        session.push_preview(torch.zeros(1, 32, 3, 1, 1))
+    with pytest.raises(ValueError, match="rollback"):
+        session.rollback_last_push()
+    assert session.available_latent_frames == 0 and session.buffer is None
+    session.final_segment = False
+    session.push(torch.zeros(1, 32, 9, 1, 1))
+    with pytest.raises(ValueError, match="final_segment=True"):
+        session.finish()
+    assert not session.finished
+    session.final_segment = True
+    session.finish()
+    assert session.finished
+
+
 def test_decoder_inputs_are_contiguous_across_clip_lengths():
     decoder = _LocalDecoder()
     observed = []

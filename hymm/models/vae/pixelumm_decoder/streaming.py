@@ -129,7 +129,13 @@ class WindowStreamingDecodeSession:
     restores the decoder and working state for the complete operation. The
     model, latent buffer, and pending pixels return to CPU between calls;
     returned pixels and retained output history still follow ``to_cpu``.
+
+    ``rolling=True`` bounds stable-prefix sessions by window/chunk geometry.
+    It requires ``retain_history=False`` and supports ``push``/``finish``;
+    replace-tail previews and rollback require the original retained timeline.
     """
+
+    final_segment = True
 
     def __init__(
         self,
@@ -137,11 +143,18 @@ class WindowStreamingDecodeSession:
         *,
         to_cpu: bool = True,
         retain_history: bool = True,
+        rolling: bool = False,
     ):
         self.model = model
         self._offload_depth = 0
         self.to_cpu = bool(to_cpu)
         self.retain_history = bool(retain_history)
+        if rolling and retain_history:
+            raise ValueError("rolling decoding requires retain_history=False")
+        self.rolling = bool(rolling)
+        self.buffer_latent_start = 0
+        self.segment_raw_start = 0
+        self.segment_visible_start = 0
         self.window = model.temporal_window_latents
         self.stride = self.window - model.temporal_overlap_latents
         self.temporal_ratio = model.time_compression_ratio
@@ -214,8 +227,8 @@ class WindowStreamingDecodeSession:
         return self.available_latent_frames * self.temporal_ratio
 
     def _segment_raw_visible_spans(self):
-        raw_start = 0
-        visible_start = 0
+        raw_start = self.segment_raw_start
+        visible_start = self.segment_visible_start
         for latent_frames, pixel_frames in zip(
             self.push_latent_frames,
             self.push_pixel_frames,
@@ -234,7 +247,7 @@ class WindowStreamingDecodeSession:
 
     def _visible_frames_before_raw(self, raw_end: int) -> int:
         raw_end = max(0, min(int(raw_end), self.available_raw_pixel_frames))
-        visible = 0
+        visible = self.segment_visible_start
         for (
             raw_start,
             raw_visible_end,
@@ -294,7 +307,37 @@ class WindowStreamingDecodeSession:
         return video[:, :, :0]
 
     def _provisional_window_starts(self) -> list[int]:
+        if self.rolling and self.available_latent_frames > self.window:
+            first = max(0, (self.committed_raw_pixel_frames // self.temporal_ratio - self.window) // self.stride + 1)
+            tail = self.available_latent_frames - self.window
+            starts = list(range(first * self.stride, tail + 1, self.stride))
+            if not starts or starts[-1] != tail:
+                starts.append(tail)
+            return starts
         return _window_starts(self.available_latent_frames, self.window, self.stride)
+
+    def _trim_completed_prefix(self) -> None:
+        if not self.rolling:
+            return
+        assert self.buffer is not None
+        stable_latent = self.committed_raw_pixel_frames // self.temporal_ratio
+        keep = max(0, (stable_latent - self.window) // self.stride + 1) * self.stride
+        keep = min(keep, self.next_window_start)
+        if keep > self.buffer_latent_start:
+            self.buffer = self.buffer[:, :, keep - self.buffer_latent_start:].clone()
+            self.buffer_latent_start = keep
+        count = 0
+        for latent_frames, pixel_frames in zip(self.push_latent_frames, self.push_pixel_frames):
+            raw_end = self.segment_raw_start + latent_frames * self.temporal_ratio
+            if raw_end > self.committed_raw_pixel_frames:
+                break
+            self.segment_raw_start = raw_end
+            self.segment_visible_start += pixel_frames
+            count += 1
+        if count:
+            del self.push_latent_frames[:count]
+            del self.push_pixel_frames[:count]
+            del self.push_stable_pixel_frames[:count]
 
     def _decode_provisional_raw(self) -> Optional[torch.Tensor]:
         """Decode the exact current tail from the raw stable boundary onward."""
@@ -519,7 +562,7 @@ class WindowStreamingDecodeSession:
 
         previous_stable = self.committed_pixel_frames
         self.buffer = (
-            latent.contiguous()
+            (latent.clone() if self.rolling else latent.contiguous())
             if self.buffer is None
             else torch.cat([self.buffer, latent], dim=2)
         )
@@ -529,6 +572,7 @@ class WindowStreamingDecodeSession:
         self.push_pixel_frames.append(segment_pixel_frames)
         stable = self._decode_ready_regular_windows()
         self.push_stable_pixel_frames.append(self.committed_pixel_frames)
+        self._trim_completed_prefix()
 
         if stable is None or self.committed_pixel_frames <= previous_stable:
             assert self.buffer is not None
@@ -555,6 +599,8 @@ class WindowStreamingDecodeSession:
         the returned tensor over the preceding provisional tail, then append
         the remaining new frames.
         """
+        if self.rolling:
+            raise ValueError("rolling decoding supports stable push(), without replace-tail previews")
         previous_available = int(self.available_pixel_frames)
         previous_stable = int(self.committed_pixel_frames)
         stable = self.push(latent, pixel_frames=pixel_frames)
@@ -615,6 +661,8 @@ class WindowStreamingDecodeSession:
     @_streaming_cpu_offloaded
     def finish(self) -> torch.Tensor:
         """Publish the withheld tail and close the append-only timeline."""
+        if self.rolling and not self.final_segment:
+            raise ValueError("rolling finish requires final_segment=True on the closing segment")
         if self.finished:
             raise RuntimeError("PixelUMM streaming decode is already finished.")
         if self.buffer is None:
@@ -640,6 +688,12 @@ class WindowStreamingDecodeSession:
         self.committed_raw_pixel_frames = self.available_raw_pixel_frames
         self.committed_pixel_frames = self.available_pixel_frames
         self.finished = True
+        if self.rolling:
+            self.buffer = self.buffer[:, :, :0].clone()
+            self.pending = None
+            self.push_latent_frames.clear()
+            self.push_pixel_frames.clear()
+            self.push_stable_pixel_frames.clear()
         if stable is None or self.committed_pixel_frames <= previous_stable:
             assert self.buffer is not None
             return self.buffer.new_empty((0,))
@@ -649,6 +703,8 @@ class WindowStreamingDecodeSession:
     @_streaming_cpu_offloaded
     def rollback_last_push(self) -> None:
         """Discard the latest segment and rebuild the exact stable prefix."""
+        if self.rolling:
+            raise ValueError("rolling decoding does not retain rollback history")
         if self.finished:
             raise RuntimeError("Cannot roll back a finalized PixelUMM session.")
         if not self.push_latent_frames:
