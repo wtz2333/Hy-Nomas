@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -335,6 +336,217 @@ def test_streaming_window_parallel_matches_single_process_full_decode():
     assert results[0]["shape_equal"]
     assert results[0]["max_abs"] <= 1e-6
     assert results[1]["numel"] == 0
+
+
+def _rolling_window_worker(rank, world_size, rendezvous, result_path):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.set_num_threads(1)
+        serial_model = _streaming_wrapper()
+        serial = serial_model.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True)
+        model = _streaming_wrapper()
+        model.configure_distributed_decode("window", process_group=dist.group.WORLD, output_rank=0)
+        parallel = model.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True)
+        serial_calls, parallel_calls = [], []
+        serial_forward, parallel_forward = serial_model.decoder.forward, model.decoder.forward
+
+        def record_serial(*args, **kwargs):
+            serial_calls.append(1)
+            return serial_forward(*args, **kwargs)
+
+        def record_parallel(*args, **kwargs):
+            parallel_calls.append(1)
+            return parallel_forward(*args, **kwargs)
+
+        serial_model.decoder.forward = record_serial
+        model.decoder.forward = record_parallel
+        generator = torch.Generator().manual_seed(301)
+        counts = []
+        lengths = [1, 3, 1, 2 * world_size + 3, 2, 4, 5]
+        for index, length in enumerate(lengths):
+            latent = torch.randn((1, 32, length, 1, 1), generator=generator)
+            pixels = length * 4 - index % 4
+            serial.final_segment = parallel.final_segment = index == 6
+            expected = serial.push(latent, pixel_frames=pixels)
+            actual = parallel.push(latent, pixel_frames=pixels)
+            assert torch.equal(actual, expected) if rank == 0 else actual.numel() == 0
+            assert parallel.committed_pixel_frames == serial.committed_pixel_frames
+            assert parallel.available_pixel_frames == serial.available_pixel_frames
+            counts.append(parallel.committed_pixel_frames)
+        expected = serial.finish()
+        actual = parallel.finish()
+        assert torch.equal(actual, expected) if rank == 0 else actual.numel() == 0
+        assert parallel.committed_pixel_frames == serial.committed_pixel_frames
+        assert parallel.finished and parallel.buffer.numel() == 0 and parallel.pending is None
+        results = [None] * world_size
+        dist.all_gather_object(
+            results,
+            {"positions": counts + [parallel.committed_pixel_frames],
+             "serial_calls": len(serial_calls), "parallel_calls": len(parallel_calls)},
+        )
+        if rank == 0:
+            Path(result_path).write_text(json.dumps(results))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+@pytest.mark.parametrize("world_size", [2, 4, 8, 16])
+def test_rolling_window_parallel_matches_serial_across_boundaries(tmp_path, world_size):
+    result_path = tmp_path / "results.json"
+    mp.start_processes(
+        _rolling_window_worker,
+        args=(world_size, str(tmp_path / "rendezvous"), str(result_path)),
+        nprocs=world_size, join=True, start_method="spawn",
+    )
+    results = json.loads(result_path.read_text())
+    assert all(result["positions"] == results[0]["positions"] for result in results)
+    assert all(result["parallel_calls"] > 0 for result in results)
+    assert sum(result["parallel_calls"] for result in results) == results[0]["serial_calls"]
+    assert results[0]["positions"][0] == 0
+    lengths = [1, 3, 1, 2 * world_size + 3, 2, 4, 5]
+    assert results[0]["positions"][-1] == sum(length * 4 - index % 4 for index, length in enumerate(lengths))
+
+
+def _window_failure_worker(rank, world_size, rendezvous, result_path):
+    from hymm.models.vae.pixelumm_decoder import autoencoder
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.set_num_threads(1)
+        latent = torch.randn((1, 32, 4, 1, 1), generator=torch.Generator().manual_seed(51))
+        failures = {}
+        for scenario in (
+            "input", "metadata", "dtype", "values", "owner", "geometry",
+            "planning", "allocation", "window", "merge", "finish",
+        ):
+            model = _streaming_wrapper()
+            model.configure_distributed_decode(
+                "window", process_group=dist.group.WORLD,
+                output_rank=1 if scenario == "owner" and rank == world_size - 1 else 0,
+            )
+            session = model.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True)
+            session.final_segment = True
+            if scenario == "finish":
+                session.push(latent, pixel_frames=16)
+            old_forward = model.decoder.forward
+            old_add = autoencoder._TemporalBlender.add
+            old_tile_grid = model._tile_grid
+            old_empty_like = torch.empty_like
+
+            def fail(*args, **kwargs):
+                raise RuntimeError(f"injected {scenario} failure")
+
+            if scenario == "window" and rank == world_size - 1:
+                model.decoder.forward = fail
+            if scenario == "planning" and rank == world_size - 1:
+                model._tile_grid = fail
+            if scenario == "allocation" and rank == 0:
+                def fail_allocation(value, *args, **kwargs):
+                    if value.ndim == 5:
+                        raise RuntimeError("injected allocation failure")
+                    return old_empty_like(value, *args, **kwargs)
+                torch.empty_like = fail_allocation
+            if scenario == "merge" and rank == 0:
+                autoencoder._TemporalBlender.add = fail
+            if scenario == "finish" and rank == 0:
+                session._visible_slice_from_raw = fail
+            if scenario == "geometry" and rank == world_size - 1:
+                model.decoder_tile_pixels = 32
+            try:
+                if scenario == "finish":
+                    session.finish()
+                elif scenario == "geometry":
+                    model.decode(latent.expand(-1, -1, -1, 2, 2))
+                else:
+                    length = 2 * world_size + 2
+                    local = (
+                        latent.repeat(1, 1, (length + 3) // 4, 1, 1)[:, :, :length]
+                        if scenario == "window" else latent
+                    )
+                    if scenario == "input" and rank == world_size - 1:
+                        local = local[:, :, :0]
+                    if scenario == "dtype" and rank == world_size - 1:
+                        local = local.double()
+                    if scenario == "values" and rank == world_size - 1:
+                        local = local + 1
+                    pixels = length * 4 if scenario == "window" else (
+                        15 if scenario == "metadata" and rank == world_size - 1 else 16
+                    )
+                    session.push(local, pixel_frames=pixels)
+            except (ValueError, RuntimeError) as exc:
+                message = str(exc)
+            else:
+                raise AssertionError(f"{scenario} did not fail on rank {rank}")
+            finally:
+                model.decoder.forward = old_forward
+                autoencoder._TemporalBlender.add = old_add
+                model._tile_grid = old_tile_grid
+                torch.empty_like = old_empty_like
+            failures[scenario] = message
+            if scenario == "owner":
+                model.configure_distributed_decode("window", process_group=dist.group.WORLD, output_rank=0)
+            if scenario == "geometry":
+                model.decoder_tile_pixels = 0
+            recovered = model.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True)
+            recovered.final_segment = True
+            first = recovered.push(latent, pixel_frames=16)
+            tail = recovered.finish()
+            assert recovered.committed_pixel_frames == 16
+            assert first.numel() + tail.numel() > 0 if rank == 0 else first.numel() + tail.numel() == 0
+        results = [None] * world_size
+        dist.all_gather_object(results, failures)
+        if rank == 0:
+            Path(result_path).write_text(json.dumps(results))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+@pytest.mark.parametrize("world_size", [2, 4, 8, 16])
+def test_window_failures_stop_all_ranks_and_allow_new_session(tmp_path, world_size):
+    result_path = tmp_path / "failures.json"
+    mp.start_processes(
+        _window_failure_worker,
+        args=(world_size, str(tmp_path / "rendezvous"), str(result_path)),
+        nprocs=world_size, join=True, start_method="spawn",
+    )
+    results = json.loads(result_path.read_text())
+    first_rank, last_rank = results[0], results[-1]
+    assert "another decode rank" in first_rank["input"]
+    assert "expected non-empty" in last_rank["input"]
+    assert "identical stream metadata" in first_rank["metadata"]
+    assert "identical stream metadata" in last_rank["metadata"]
+    assert "identical latent shapes and dtypes" in first_rank["dtype"]
+    assert "identical latent shapes and dtypes" in last_rank["dtype"]
+    assert "identical latent values" in first_rank["values"]
+    assert "identical latent values" in last_rank["values"]
+    assert "identical stream metadata" in first_rank["owner"]
+    assert "identical stream metadata" in last_rank["owner"]
+    assert "identical stream metadata" in first_rank["geometry"]
+    assert "identical stream metadata" in last_rank["geometry"]
+    assert "another decode rank" in first_rank["planning"]
+    assert "injected planning failure" in last_rank["planning"]
+    assert "injected allocation failure" in first_rank["allocation"]
+    assert "another decode rank" in last_rank["allocation"]
+    assert "another decode rank" in first_rank["window"]
+    assert "injected window failure" in last_rank["window"]
+    assert "injected merge failure" in first_rank["merge"]
+    assert "another decode rank" in last_rank["merge"]
+    assert "injected finish failure" in first_rank["finish"]
+    assert "another decode rank" in last_rank["finish"]
+    for peer in results[1:-1]:
+        assert "another decode rank" in peer["input"]
+        assert "another decode rank" in peer["window"]
+        assert "another decode rank" in peer["allocation"]
+        assert "another decode rank" in peer["merge"]
+        assert "another decode rank" in peer["finish"]
 
 
 def _worker(rank, world_size, geometry, rendezvous, result_path):

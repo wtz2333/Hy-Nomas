@@ -25,6 +25,7 @@ Deliberate differences from the source, none of which changes the model function
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,6 +117,7 @@ class PixelUMMDCAELatentDecoder(nn.Module):
     """Decode DCAE-V c32 latents with the PixelUMM DMD2 student (pipeline ``self.vae``)."""
 
     handles_distributed_decode = True
+    window_error_sync_version = 1
     spatial_compression_ratio = 32
     time_compression_ratio = 4
     ffactor_spatial = 32
@@ -288,6 +290,25 @@ class PixelUMMDCAELatentDecoder(nn.Module):
         self._distributed_decode_group = process_group
         self._distributed_decode_output_rank = int(output_rank)
 
+    @contextmanager
+    def _window_error_guard(self, operation: str):
+        if self._distributed_decode_mode == "none":
+            yield
+            return
+        error = None
+        try:
+            yield
+        except Exception as exc:
+            error = exc
+        failed = torch.tensor(
+            [int(error is not None)], dtype=torch.int32, device=next(self.parameters()).device
+        )
+        dist.all_reduce(failed, group=self._distributed_decode_group)
+        if error is not None:
+            raise error
+        if failed.item():
+            raise RuntimeError(f"PixelUMM {operation} failed on another decode rank")
+
     # ------------------------------------------------------------------
     # geometry / noise
     # ------------------------------------------------------------------
@@ -358,42 +379,54 @@ class PixelUMMDCAELatentDecoder(nn.Module):
         By default the whole clip is covered. ``t_starts`` selects explicit latent window starts
         (streaming); the result then covers ``[t_starts[0], t_starts[-1] + window)`` latents.
         """
-        frames, height, width = (int(v) for v in latent.shape[2:])
-        window = self.temporal_window_latents
-        if t_starts is None:
-            t_starts = _window_starts(frames, window, window - self.temporal_overlap_latents)
-        t_starts = list(t_starts)
-        origin = t_starts[0]
-        t_len = min(window, frames)
-        ys, xs, tile_h, tile_w = self._tile_grid(height, width)
-        spatial = [(y, x) for y in ys for x in xs]
-        tasks = [(ti, y, x) for ti in range(len(t_starts)) for y, x in spatial]
-        if self.decoder.local_attention_tile:
-            # The sliding-tile mask is built per input shape and cached. Build it here so a
-            # compiled decoder (``compile_decoder``) only looks it up: building is not fullgraph
-            # traceable. Same call the decoder's own forward makes, so eager results are unchanged.
-            local_attention_layout(
-                (t_len, tile_h * LATENT_TOKEN_GRID, tile_w * LATENT_TOKEN_GRID),
-                self.decoder.local_attention_tile,
-                latent.device,
-            )
+        with self._window_error_guard("window preparation"):
+            frames, height, width = (int(v) for v in latent.shape[2:])
+            window = self.temporal_window_latents
+            if t_starts is None:
+                t_starts = _window_starts(frames, window, window - self.temporal_overlap_latents)
+            t_starts = list(t_starts)
+            origin = t_starts[0]
+            t_len = min(window, frames)
+            ys, xs, tile_h, tile_w = self._tile_grid(height, width)
+            spatial = [(y, x) for y in ys for x in xs]
+            tasks = [(ti, y, x) for ti in range(len(t_starts)) for y, x in spatial]
+            if self.decoder.local_attention_tile:
+                # The sliding-tile mask is built per input shape and cached. Build it here so a
+                # compiled decoder (``compile_decoder``) only looks it up: building is not fullgraph
+                # traceable. Same call the decoder's own forward makes, so eager results are unchanged.
+                local_attention_layout(
+                    (t_len, tile_h * LATENT_TOKEN_GRID, tile_w * LATENT_TOKEN_GRID),
+                    self.decoder.local_attention_tile,
+                    latent.device,
+                )
 
-        # ``pad_short`` (streaming tail fix): a window on the stride grid may hold fewer than
-        # ``window`` real latents at the end of the timeline. Fill it to the full window with noise
-        # drawn from the per-channel mean/variance of the real latents, as tailrand training does.
-        # The padded frames are decoded only as context; callers read just the real range.
-        pad_noise = None
-        if pad_short and frames >= window and t_starts[-1] + window > frames:
-            variance, mean = torch.var_mean(latent.detach().float(), dim=(2, 3, 4), correction=0, keepdim=True)
-            generator = torch.Generator(device=latent.device)
-            generator.manual_seed(self.seed * 1_000_003 + frames - 1)
-            pad_noise = mean + variance.sqrt() * torch.randn(
-                (latent.shape[0], latent.shape[1], window, height, width),
-                generator=generator,
-                device=latent.device,
-                dtype=torch.float32,
-            )
-        stride = window - self.temporal_overlap_latents
+            # ``pad_short`` (streaming tail fix): a window on the stride grid may hold fewer than
+            # ``window`` real latents at the end of the timeline. Fill it to the full window with noise
+            # drawn from the per-channel mean/variance of the real latents, as tailrand training does.
+            # The padded frames are decoded only as context; callers read just the real range.
+            pad_noise = None
+            if pad_short and frames >= window and t_starts[-1] + window > frames:
+                variance, mean = torch.var_mean(latent.detach().float(), dim=(2, 3, 4), correction=0, keepdim=True)
+                generator = torch.Generator(device=latent.device)
+                generator.manual_seed(self.seed * 1_000_003 + frames - 1)
+                pad_noise = mean + variance.sqrt() * torch.randn(
+                    (latent.shape[0], latent.shape[1], window, height, width),
+                    generator=generator,
+                    device=latent.device,
+                    dtype=torch.float32,
+                )
+            stride = window - self.temporal_overlap_latents
+
+        if self._distributed_decode_mode != "none":
+            with self._window_error_guard("window task metadata"):
+                seed = (self.seed + (1 << 63)) % (1 << 64) - (1 << 63)
+                metadata = (
+                    int(all_ranks), int(pad_short), int(output_cpu), seed, self.num_steps,
+                    self._distributed_decode_output_rank, frames, height, width,
+                    window, stride, t_len, tile_h, tile_w, len(t_starts), len(ys), len(xs),
+                    *t_starts, *ys, *xs,
+                )
+            self._validate_distributed_metadata(metadata, latent.device)
 
         def run(task) -> torch.Tensor:
             ti, y, x = task
@@ -442,40 +475,72 @@ class PixelUMMDCAELatentDecoder(nn.Module):
         idle_shape = (latent.shape[0], 3, t_len * 4, tile_h * 32, tile_w * 32)
         for first in range(0, len(tasks), world_size):
             index = first + rank
-            if index < len(tasks):
-                local = run(tasks[index]).contiguous()
-            else:
-                local = torch.empty(idle_shape, device=latent.device, dtype=self.dtype)
+            with self._window_error_guard("window computation"):
+                if index < len(tasks):
+                    local = run(tasks[index]).contiguous()
+                else:
+                    local = torch.empty(idle_shape, device=latent.device, dtype=self.dtype)
+                gathered = [torch.empty_like(local) for _ in range(world_size)] if receives else None
             if all_ranks:
-                gathered = [torch.empty_like(local) for _ in range(world_size)]
                 dist.all_gather(gathered, local, group=group)
             else:
-                gathered = [torch.empty_like(local) for _ in range(world_size)] if receives else None
                 dist.gather(local, gather_list=gathered, dst=output_global_rank, group=group)
-            if receives:
-                for source_rank, output in enumerate(gathered):
-                    if first + source_rank < len(tasks):
-                        absorb(first + source_rank, output)
+            with self._window_error_guard("window merge"):
+                if receives:
+                    for source_rank, output in enumerate(gathered):
+                        if first + source_rank < len(tasks):
+                            absorb(first + source_rank, output)
             del gathered, local
-        if not receives:
-            return None
-        if pending or next_window != len(t_starts):
-            raise RuntimeError("PixelUMM window-parallel decode left incomplete windows")
-        return blender.result()
+        result = None
+        with self._window_error_guard("window finalization"):
+            if receives:
+                if pending or next_window != len(t_starts):
+                    raise RuntimeError("PixelUMM window-parallel decode left incomplete windows")
+                result = blender.result()
+        return result
+
+    def _latent_signature(self, latent: torch.Tensor) -> torch.Tensor:
+        if latent.device != next(self.parameters()).device:
+            raise ValueError("PixelUMM distributed latent must be on the decoder device")
+        dtype = str(latent.dtype).encode("ascii")
+        if len(dtype) > 32:
+            raise ValueError(f"PixelUMM distributed latent dtype name is too long: {latent.dtype}")
+        return torch.tensor(
+            (*latent.shape, *dtype, *([0] * (32 - len(dtype)))), dtype=torch.int64, device=latent.device
+        )
 
     def _broadcast_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """All SP ranks must decode the identical latent: take the output rank's copy."""
         group = self._distributed_decode_group
         output_rank = self._distributed_decode_output_rank
         source = dist.get_global_rank(group, output_rank) if hasattr(dist, "get_global_rank") else output_rank
-        shape = torch.tensor(latent.shape, dtype=torch.int64, device=latent.device)
-        shapes = [torch.empty_like(shape) for _ in range(dist.get_world_size(group))]
+        self._validate_distributed_metadata((output_rank,), latent.device)
+        with self._window_error_guard("latent shape preparation"):
+            shape = self._latent_signature(latent)
+            shapes = [torch.empty_like(shape) for _ in range(dist.get_world_size(group))]
         dist.all_gather(shapes, shape, group=group)
         if any(not torch.equal(shape, other) for other in shapes):
-            raise ValueError("PixelUMM distributed decode requires identical latent shapes")
-        latent = latent.contiguous().clone()
+            raise ValueError("PixelUMM distributed decode requires identical latent shapes and dtypes")
+        with self._window_error_guard("latent broadcast preparation"):
+            latent = latent.contiguous().clone()
         dist.broadcast(latent, src=source, group=group)
         return latent
+
+    def _validate_distributed_metadata(self, values: Sequence[int], device: torch.device) -> None:
+        group = self._distributed_decode_group
+        world_size = dist.get_world_size(group)
+        with self._window_error_guard("stream metadata preparation"):
+            length = torch.tensor([len(values)], dtype=torch.int64, device=device)
+            lengths = [torch.empty_like(length) for _ in range(world_size)]
+        dist.all_gather(lengths, length, group=group)
+        if any(not torch.equal(length, candidate) for candidate in lengths):
+            raise ValueError("PixelUMM distributed decode requires identical stream metadata")
+        with self._window_error_guard("stream metadata allocation"):
+            metadata = torch.tensor(values, dtype=torch.int64, device=device)
+            peers = [torch.empty_like(metadata) for _ in range(world_size)]
+        dist.all_gather(peers, metadata, group=group)
+        if any(not torch.equal(metadata, candidate) for candidate in peers):
+            raise ValueError("PixelUMM distributed decode requires identical stream metadata")
 
     # Streaming pushes must agree across the SP group.
     def _validate_distributed_input(self, latent: torch.Tensor) -> None:
@@ -483,27 +548,30 @@ class PixelUMMDCAELatentDecoder(nn.Module):
         world_size = dist.get_world_size(group)
         rank = dist.get_rank(group)
         output_rank = self._distributed_decode_output_rank
-        shape = torch.tensor(latent.shape, dtype=torch.int64, device=latent.device)
-        shapes = [torch.empty_like(shape) for _ in range(world_size)]
+        with self._window_error_guard("latent shape preparation"):
+            shape = self._latent_signature(latent)
+            shapes = [torch.empty_like(shape) for _ in range(world_size)]
         dist.all_gather(shapes, shape, group=group)
         if any(not torch.equal(shape, candidate) for candidate in shapes):
-            raise ValueError("PixelUMM distributed decode requires identical latent shapes")
-        reference = (
-            latent.contiguous().clone()
-            if rank == output_rank
-            else torch.empty_like(latent)
-        )
+            raise ValueError("PixelUMM distributed decode requires identical latent shapes and dtypes")
+        with self._window_error_guard("latent broadcast preparation"):
+            reference = (
+                latent.contiguous().clone()
+                if rank == output_rank
+                else torch.empty_like(latent)
+            )
         source_rank = (
             dist.get_global_rank(group, output_rank)
             if hasattr(dist, "get_global_rank")
             else output_rank
         )
         dist.broadcast(reference, src=source_rank, group=group)
-        equal = torch.tensor(
-            int(torch.equal(latent, reference)),
-            dtype=torch.int32,
-            device=latent.device,
-        )
+        with self._window_error_guard("latent comparison"):
+            equal = torch.tensor(
+                int(torch.equal(latent, reference)),
+                dtype=torch.int32,
+                device=latent.device,
+            )
         dist.all_reduce(equal, op=dist.ReduceOp.MIN, group=group)
         if not bool(equal.item()):
             raise ValueError("PixelUMM distributed decode requires identical latent values")
@@ -533,34 +601,41 @@ class PixelUMMDCAELatentDecoder(nn.Module):
         pixel_frames: Optional[int] = None,
     ):
         del generator  # noise comes from ``self.seed``, identical on every SP rank
-        if latent.ndim != 5:
-            raise ValueError(f"expected [B,C,T,H,W], got {tuple(latent.shape)}")
+        with self._window_error_guard("offline input validation"):
+            if latent.ndim != 5:
+                raise ValueError(f"expected [B,C,T,H,W], got {tuple(latent.shape)}")
+            if self._distributed_decode_mode != "none" and latent.device != next(self.parameters()).device:
+                raise ValueError("PixelUMM distributed latent must be on the decoder device")
         if self._distributed_decode_mode != "none":
             latent = self._broadcast_latent(latent)
         steps = self.denoising_step_list[: self.num_steps]
         try:
             if len(steps) == 1:
+                with self._window_error_guard("offline window input preparation"):
+                    source = self._noise_tile(latent)
                 video = self._predict_x0(
-                    latent, self._noise_tile(latent), all_ranks=False,
+                    latent, source, all_ranks=False,
                     output_cpu=self.decode_output_cpu,
                 )
             else:
                 video = self._sample_multistep(latent, steps)
         finally:
             self._noise_cache = None
-        if video is None:
-            video = latent.new_empty((0,))
-        elif pixel_frames is not None:
-            target = int(pixel_frames)
-            if not 1 <= target <= video.shape[2]:
-                raise ValueError(f"pixel_frames={target} is outside decoded T={video.shape[2]}")
-            if target < video.shape[2]:
-                video = video[:, :, :target]
+        with self._window_error_guard("offline output preparation"):
+            if video is None:
+                video = latent.new_empty((0,))
+            elif pixel_frames is not None:
+                target = int(pixel_frames)
+                if not 1 <= target <= video.shape[2]:
+                    raise ValueError(f"pixel_frames={target} is outside decoded T={video.shape[2]}")
+                if target < video.shape[2]:
+                    video = video[:, :, :target]
         return _DecodeOutput(video) if return_dict else (video,)
 
     def _sample_multistep(self, latent: torch.Tensor, steps: Sequence[float]) -> Optional[torch.Tensor]:
         """Source ``sample_distilled`` with a full-clip fp32 state on every rank."""
-        state = self._make_noise(latent, 0, int(latent.shape[2]))
+        with self._window_error_guard("multistep state preparation"):
+            state = self._make_noise(latent, 0, int(latent.shape[2]))
 
         def source(t0: int, t1: int, y: int, x: int, th: int, tw: int) -> torch.Tensor:
             return state[:, :, t0 * 4 : t1 * 4, y * 32 : (y + th) * 32, x * 32 : (x + tw) * 32]
@@ -572,12 +647,13 @@ class PixelUMMDCAELatentDecoder(nn.Module):
                     latent, source, all_ranks=False, output_cpu=self.decode_output_cpu,
                 )
             x0 = self._predict_x0(latent, source, all_ranks=True)
-            ratio = t_next / t_cur
-            for offset in range(0, state.shape[2], _STATE_BLOCK_FRAMES):
-                block = slice(offset, offset + _STATE_BLOCK_FRAMES)
-                anchor = x0[:, :, block].float()
-                state[:, :, block] = anchor + ratio * (state[:, :, block] - anchor)
-            del x0
+            with self._window_error_guard("multistep state update"):
+                ratio = t_next / t_cur
+                for offset in range(0, state.shape[2], _STATE_BLOCK_FRAMES):
+                    block = slice(offset, offset + _STATE_BLOCK_FRAMES)
+                    anchor = x0[:, :, block].float()
+                    state[:, :, block] = anchor + ratio * (state[:, :, block] - anchor)
+                del x0
         raise AssertionError("unreachable")
 
 
@@ -605,18 +681,22 @@ class PixelUMMStreamingDecodeSession(WindowStreamingDecodeSession):
         return [0] if length <= self.window else list(range(0, length, self.stride))
 
     def _decode_windows(self, starts: list[int]) -> Optional[torch.Tensor]:
-        assert self.buffer is not None
         model = self.model
+        with model._window_error_guard("window input preparation"):
+            assert self.buffer is not None
+            source = model._noise_tile(self.buffer, frame_offset=self.buffer_latent_start)
+            relative_starts = [start - self.buffer_latent_start for start in starts]
         try:
             video = model._predict_x0(
                 self.buffer,
-                model._noise_tile(self.buffer, frame_offset=self.buffer_latent_start),
+                source,
                 all_ranks=False,
-                t_starts=[start - self.buffer_latent_start for start in starts],
+                t_starts=relative_starts,
                 pad_short=self._tail_fix(),
             )
         finally:
             model._noise_cache = None
-        if video is None:
-            return None
-        return video.cpu() if self.to_cpu else video
+        with model._window_error_guard("window output transfer"):
+            if video is not None and self.to_cpu:
+                video = video.cpu()
+        return video

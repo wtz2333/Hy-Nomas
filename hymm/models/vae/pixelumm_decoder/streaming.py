@@ -201,6 +201,27 @@ class WindowStreamingDecodeSession:
         group = self.model._distributed_decode_group
         return dist.get_rank(group) == self.model._distributed_decode_output_rank
 
+    def _validate_parallel_state(self, operation: int, pixel_frames: int) -> None:
+        if self.model._distributed_decode_mode == "none":
+            return
+        with self.model._window_error_guard("stream state preparation"):
+            shape = () if self.buffer is None else tuple(self.buffer.shape)
+            values = (
+                operation, pixel_frames, int(self.final_segment), int(self.finished),
+                int(self.rolling), int(self.to_cpu), int(self.retain_history),
+                self.model._distributed_decode_output_rank,
+                self.window, self.stride, self.temporal_ratio,
+                self.available_latent_frames, self.available_pixel_frames,
+                self.next_window_start, self.committed_raw_pixel_frames,
+                self.committed_pixel_frames, self.buffer_latent_start,
+                self.segment_raw_start, self.segment_visible_start,
+                len(shape), len(self.push_latent_frames), len(self.push_pixel_frames),
+                len(self.push_stable_pixel_frames), *shape, *self.push_latent_frames,
+                *self.push_pixel_frames, *self.push_stable_pixel_frames,
+            )
+            device = next(self.model.parameters()).device
+        self.model._validate_distributed_metadata(values, device)
+
     def _decode_windows(self, starts: list[int]) -> Optional[torch.Tensor]:
         raise NotImplementedError
 
@@ -341,75 +362,66 @@ class WindowStreamingDecodeSession:
 
     def _decode_provisional_raw(self) -> Optional[torch.Tensor]:
         """Decode the exact current tail from the raw stable boundary onward."""
-        raw_start = self.committed_raw_pixel_frames
-        raw_end = self.available_raw_pixel_frames
-        if raw_end <= raw_start:
-            if not self._is_output_rank():
-                return None
-            assert self.buffer is not None
-            if self.pending is not None:
-                return self.pending[:, :, :0]
-            return self.buffer.new_empty((0,))
-
-        # All ranks can derive how far the regular-window decoder has covered.
-        # When that already spans the requested tail, the output rank can reuse
-        # ``pending`` and non-output ranks can skip a redundant collective call.
-        regular_decoded_latent_end = (
-            self.next_window_start - self.stride + self.window
-            if self.next_window_start > 0
-            else 0
-        )
-        regular_decoded_raw_end = regular_decoded_latent_end * self.temporal_ratio
-        if raw_end <= regular_decoded_raw_end:
-            if not self._is_output_rank():
-                return None
-            if self.pending is not None:
-                pending_end = self.pending_pixel_start + int(self.pending.shape[2])
-                if not (
-                    self.pending_pixel_start <= raw_start and pending_end >= raw_end
-                ):
-                    raise RuntimeError(
-                        "PixelUMM pending output does not cover the regular decoded "
-                        f"range [{raw_start}, {raw_end}); pending="
-                        f"[{self.pending_pixel_start}, {pending_end})"
+        with self.model._window_error_guard("stream tail planning"):
+            raw_start = self.committed_raw_pixel_frames
+            raw_end = self.available_raw_pixel_frames
+            selected_starts = None
+            result = None
+            if raw_end <= raw_start:
+                if self._is_output_rank():
+                    assert self.buffer is not None
+                    result = self.pending[:, :, :0] if self.pending is not None else self.buffer.new_empty((0,))
+            else:
+                # All ranks can derive how far the regular-window decoder has covered.
+                # When that already spans the requested tail, the output rank can reuse
+                # ``pending`` and non-output ranks can skip a redundant collective call.
+                regular_decoded_latent_end = (
+                    self.next_window_start - self.stride + self.window
+                    if self.next_window_start > 0
+                    else 0
+                )
+                regular_decoded_raw_end = regular_decoded_latent_end * self.temporal_ratio
+                if raw_end <= regular_decoded_raw_end:
+                    if self._is_output_rank():
+                        if self.pending is None:
+                            raise RuntimeError("PixelUMM output rank is missing pending regular-window output")
+                        pending_end = self.pending_pixel_start + int(self.pending.shape[2])
+                        if not self.pending_pixel_start <= raw_start <= raw_end <= pending_end:
+                            raise RuntimeError(
+                                "PixelUMM pending output does not cover the regular decoded "
+                                f"range [{raw_start}, {raw_end}); pending="
+                                f"[{self.pending_pixel_start}, {pending_end})"
+                            )
+                        result = self.pending[
+                            :, :, raw_start - self.pending_pixel_start : raw_end - self.pending_pixel_start
+                        ].contiguous()
+                else:
+                    assert self.buffer is not None
+                    starts = self._provisional_window_starts()
+                    committed_latent = raw_start // self.temporal_ratio
+                    first_index = next(
+                        (index for index, start in enumerate(starts) if start + self.window > committed_latent),
+                        len(starts) - 1,
                     )
-                return self.pending[
-                    :,
-                    :,
-                    raw_start - self.pending_pixel_start : raw_end
-                    - self.pending_pixel_start,
-                ].contiguous()
-            raise RuntimeError(
-                "PixelUMM output rank is missing pending regular-window output"
-            )
-
-        assert self.buffer is not None
-        starts = self._provisional_window_starts()
-        committed_latent = raw_start // self.temporal_ratio
-        first_index = next(
-            (
-                index
-                for index, start in enumerate(starts)
-                if start + self.window > committed_latent
-            ),
-            len(starts) - 1,
-        )
-        selected_starts = starts[first_index:]
+                    selected_starts = starts[first_index:]
+        if selected_starts is None:
+            return result
         decoded = self._decode_windows(selected_starts)
-        if not self._is_output_rank():
-            return None
-        assert decoded is not None
-        decoded_raw_start = selected_starts[0] * self.temporal_ratio
-        local_start = raw_start - decoded_raw_start
-        local_end = raw_end - decoded_raw_start
-        if not 0 <= local_start <= local_end <= decoded.shape[2]:
-            raise RuntimeError(
-                "PixelUMM provisional decode does not cover the requested raw range: "
-                f"decoded_start={decoded_raw_start}, "
-                f"requested=[{raw_start}, {raw_end}), "
-                f"decoded_frames={decoded.shape[2]}"
-            )
-        return decoded[:, :, local_start:local_end].contiguous()
+        with self.model._window_error_guard("stream tail slicing"):
+            if self._is_output_rank():
+                assert decoded is not None
+                decoded_raw_start = selected_starts[0] * self.temporal_ratio
+                local_start = raw_start - decoded_raw_start
+                local_end = raw_end - decoded_raw_start
+                if not 0 <= local_start <= local_end <= decoded.shape[2]:
+                    raise RuntimeError(
+                        "PixelUMM provisional decode does not cover the requested raw range: "
+                        f"decoded_start={decoded_raw_start}, "
+                        f"requested=[{raw_start}, {raw_end}), "
+                        f"decoded_frames={decoded.shape[2]}"
+                    )
+                result = decoded[:, :, local_start:local_end].contiguous()
+        return result
 
     def _commit_until(self, stable_raw_until: int) -> Optional[torch.Tensor]:
         stable_raw_until = int(stable_raw_until)
@@ -447,29 +459,32 @@ class WindowStreamingDecodeSession:
         return stable
 
     def _decode_ready_regular_windows(self) -> Optional[torch.Tensor]:
-        starts = []
-        while self.next_window_start + self.window <= self.available_latent_frames:
-            starts.append(self.next_window_start)
-            self.next_window_start += self.stride
+        with self.model._window_error_guard("stream window planning"):
+            starts = []
+            while self.next_window_start + self.window <= self.available_latent_frames:
+                starts.append(self.next_window_start)
+                self.next_window_start += self.stride
         if not starts:
             return None
         decoded = self._decode_windows(starts)
-        if self._is_output_rank():
-            assert decoded is not None
-            self._append_decoded_windows(
-                decoded,
-                first_window_start=starts[0],
+        with self.model._window_error_guard("stream stable-prefix commit"):
+            if self._is_output_rank():
+                assert decoded is not None
+                self._append_decoded_windows(
+                    decoded,
+                    first_window_start=starts[0],
+                )
+            # A non-stride-aligned end preview uses a window anchored at the current
+            # tail. A one-latent append can shift that window one frame to the right,
+            # so only frames strictly before that possible shifted window are stable.
+            tail_start = self.available_latent_frames - self.window
+            stable_latent_frames = (
+                tail_start + 1
+                if tail_start >= 0 and tail_start % self.stride == 0
+                else max(0, tail_start)
             )
-        # A non-stride-aligned end preview uses a window anchored at the current
-        # tail. A one-latent append can shift that window one frame to the right,
-        # so only frames strictly before that possible shifted window are stable.
-        tail_start = self.available_latent_frames - self.window
-        stable_latent_frames = (
-            tail_start + 1
-            if tail_start >= 0 and tail_start % self.stride == 0
-            else max(0, tail_start)
-        )
-        return self._commit_until(stable_latent_frames * self.temporal_ratio)
+            stable = self._commit_until(stable_latent_frames * self.temporal_ratio)
+        return stable
 
     @property
     def stable_pixel_frames(self) -> int:
@@ -531,52 +546,55 @@ class WindowStreamingDecodeSession:
         pixel_frames: Optional[int] = None,
     ) -> torch.Tensor:
         """Append one arbitrary-length segment and return newly stable pixels."""
-        if self.finished:
-            raise RuntimeError("Cannot push PixelUMM latents after finish().")
-        if latent.ndim != 5 or latent.shape[2] <= 0:
-            raise ValueError(
-                f"expected non-empty [B,C,T,H,W], got {tuple(latent.shape)}"
+        with self.model._window_error_guard("stream input validation"):
+            if self.finished:
+                raise RuntimeError("Cannot push PixelUMM latents after finish().")
+            if latent.ndim != 5 or latent.shape[2] <= 0:
+                raise ValueError(
+                    f"expected non-empty [B,C,T,H,W], got {tuple(latent.shape)}"
+                )
+            latent_frames = int(latent.shape[2])
+            segment_pixel_frames = (
+                latent_frames * self.temporal_ratio
+                if pixel_frames is None
+                else int(pixel_frames)
             )
-        latent_frames = int(latent.shape[2])
-        segment_pixel_frames = (
-            latent_frames * self.temporal_ratio
-            if pixel_frames is None
-            else int(pixel_frames)
-        )
-        if segment_pixel_frames <= 0:
-            raise ValueError("pixel_frames must be positive")
-        min_pixel_frames = (latent_frames - 1) * self.temporal_ratio + 1
-        max_pixel_frames = latent_frames * self.temporal_ratio
-        if not min_pixel_frames <= segment_pixel_frames <= max_pixel_frames:
-            raise ValueError(
-                "PixelUMM streaming segment pixel length is inconsistent with its "
-                f"latent length: latent_frames={latent_frames}, "
-                f"pixel_frames={segment_pixel_frames}, "
-                f"expected_range=[{min_pixel_frames}, {max_pixel_frames}]."
-            )
-        controller = getattr(self.model, "_model_cpu_offload", None)
-        if controller is not None:
-            latent = latent.to(device=controller.device, non_blocking=False)
+            if segment_pixel_frames <= 0:
+                raise ValueError("pixel_frames must be positive")
+            min_pixel_frames = (latent_frames - 1) * self.temporal_ratio + 1
+            max_pixel_frames = latent_frames * self.temporal_ratio
+            if not min_pixel_frames <= segment_pixel_frames <= max_pixel_frames:
+                raise ValueError(
+                    "PixelUMM streaming segment pixel length is inconsistent with its "
+                    f"latent length: latent_frames={latent_frames}, "
+                    f"pixel_frames={segment_pixel_frames}, "
+                    f"expected_range=[{min_pixel_frames}, {max_pixel_frames}]."
+                )
+            controller = getattr(self.model, "_model_cpu_offload", None)
+            if controller is not None:
+                latent = latent.to(device=controller.device, non_blocking=False)
+        self._validate_parallel_state(0, segment_pixel_frames)
         if self.model._distributed_decode_mode != "none":
             self.model._validate_distributed_input(latent)
 
-        previous_stable = self.committed_pixel_frames
-        self.buffer = (
-            (latent.clone() if self.rolling else latent.contiguous())
-            if self.buffer is None
-            else torch.cat([self.buffer, latent], dim=2)
-        )
-        self.available_latent_frames += latent_frames
-        self.available_pixel_frames += segment_pixel_frames
-        self.push_latent_frames.append(latent_frames)
-        self.push_pixel_frames.append(segment_pixel_frames)
+        with self.model._window_error_guard("stream buffer append"):
+            previous_stable = self.committed_pixel_frames
+            self.buffer = (
+                (latent.clone() if self.rolling else latent.contiguous())
+                if self.buffer is None
+                else torch.cat([self.buffer, latent], dim=2)
+            )
+            self.available_latent_frames += latent_frames
+            self.available_pixel_frames += segment_pixel_frames
+            self.push_latent_frames.append(latent_frames)
+            self.push_pixel_frames.append(segment_pixel_frames)
         stable = self._decode_ready_regular_windows()
-        self.push_stable_pixel_frames.append(self.committed_pixel_frames)
-        self._trim_completed_prefix()
-
-        if stable is None or self.committed_pixel_frames <= previous_stable:
-            assert self.buffer is not None
-            return self.buffer.new_empty((0,))
+        with self.model._window_error_guard("stream push finalization"):
+            self.push_stable_pixel_frames.append(self.committed_pixel_frames)
+            self._trim_completed_prefix()
+            if stable is None or self.committed_pixel_frames <= previous_stable:
+                assert self.buffer is not None
+                stable = self.buffer.new_empty((0,))
         return stable
 
     @torch.no_grad()
@@ -661,42 +679,45 @@ class WindowStreamingDecodeSession:
     @_streaming_cpu_offloaded
     def finish(self) -> torch.Tensor:
         """Publish the withheld tail and close the append-only timeline."""
-        if self.rolling and not self.final_segment:
-            raise ValueError("rolling finish requires final_segment=True on the closing segment")
-        if self.finished:
-            raise RuntimeError("PixelUMM streaming decode is already finished.")
-        if self.buffer is None:
-            raise RuntimeError("Cannot finish an empty PixelUMM streaming session.")
+        with self.model._window_error_guard("stream finish validation"):
+            if self.rolling and not self.final_segment:
+                raise ValueError("rolling finish requires final_segment=True on the closing segment")
+            if self.finished:
+                raise RuntimeError("PixelUMM streaming decode is already finished.")
+            if self.buffer is None:
+                raise RuntimeError("Cannot finish an empty PixelUMM streaming session.")
+        self._validate_parallel_state(1, -1)
         previous_stable = self.committed_pixel_frames
         provisional_raw = self._decode_provisional_raw()
-        if self._is_output_rank():
-            assert provisional_raw is not None
-            stable = self._visible_slice_from_raw(
-                provisional_raw,
-                raw_start=self.committed_raw_pixel_frames,
-                raw_end=self.available_raw_pixel_frames,
-            )
-            if self.to_cpu:
-                stable = stable.cpu()
-            if self.retain_history and stable.shape[2] > 0:
-                self.committed.append((previous_stable, stable))
-            if self.pending is not None:
-                self.pending = self.pending[:, :, :0]
-            self.pending_pixel_start = self.available_raw_pixel_frames
-        else:
-            stable = None
-        self.committed_raw_pixel_frames = self.available_raw_pixel_frames
-        self.committed_pixel_frames = self.available_pixel_frames
-        self.finished = True
-        if self.rolling:
-            self.buffer = self.buffer[:, :, :0].clone()
-            self.pending = None
-            self.push_latent_frames.clear()
-            self.push_pixel_frames.clear()
-            self.push_stable_pixel_frames.clear()
-        if stable is None or self.committed_pixel_frames <= previous_stable:
-            assert self.buffer is not None
-            return self.buffer.new_empty((0,))
+        with self.model._window_error_guard("stream finish commit"):
+            if self._is_output_rank():
+                assert provisional_raw is not None
+                stable = self._visible_slice_from_raw(
+                    provisional_raw,
+                    raw_start=self.committed_raw_pixel_frames,
+                    raw_end=self.available_raw_pixel_frames,
+                )
+                if self.to_cpu:
+                    stable = stable.cpu()
+                if self.retain_history and stable.shape[2] > 0:
+                    self.committed.append((previous_stable, stable))
+                if self.pending is not None:
+                    self.pending = self.pending[:, :, :0]
+                self.pending_pixel_start = self.available_raw_pixel_frames
+            else:
+                stable = None
+            self.committed_raw_pixel_frames = self.available_raw_pixel_frames
+            self.committed_pixel_frames = self.available_pixel_frames
+            self.finished = True
+            if self.rolling:
+                self.buffer = self.buffer[:, :, :0].clone()
+                self.pending = None
+                self.push_latent_frames.clear()
+                self.push_pixel_frames.clear()
+                self.push_stable_pixel_frames.clear()
+            if stable is None or self.committed_pixel_frames <= previous_stable:
+                assert self.buffer is not None
+                stable = self.buffer.new_empty((0,))
         return stable
 
     @torch.no_grad()
